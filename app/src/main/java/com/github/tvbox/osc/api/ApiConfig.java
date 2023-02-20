@@ -36,7 +36,10 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -125,7 +128,9 @@ public class ApiConfig {
         }
         return "".getBytes();
     }
-
+//无本地写入权限的情况下 支持从assets读取json/jar
+//格式为 asset://assets_folder_name/file_name.json
+//支持相对路径
     public void loadConfig(boolean useCache, LoadConfigCallback callback, Activity activity) {
         String apiUrl = Hawk.get(HawkConfig.API_URL, "");
         if (apiUrl.isEmpty()) {
@@ -142,12 +147,22 @@ public class ApiConfig {
                 th.printStackTrace();
             }
         }
-        String TempKey = null, configUrl = "", pk = ";pk;";
+        String TempKey = null, configUrl = "", config = "", pk = ";pk;";
         if (apiUrl.contains(pk)) {
             String[] a = apiUrl.split(pk);
             TempKey = a[1];
             if (apiUrl.startsWith("clan")){
                 configUrl = clanToAddress(a[0]);
+            }else if(apiUrl.startsWith("asset://")){
+            try {
+                config = readAssetsText(a[0].replace("asset://",""));
+                parseJson(apiUrl, config);
+                callback.success();
+            } catch (Throwable th) {
+                th.printStackTrace();
+                callback.error("解析配置失败");
+            }
+            return;
             }else if (apiUrl.startsWith("http")){
                 configUrl = a[0];
             }else {
@@ -155,6 +170,16 @@ public class ApiConfig {
             }
         } else if (apiUrl.startsWith("clan")) {
             configUrl = clanToAddress(apiUrl);
+        } else if (apiUrl.startsWith("asset://")) {
+            try {
+                config = readAssetsText(apiUrl.replace("asset://",""));
+                parseJson(apiUrl, config);
+                callback.success();
+            } catch (Throwable th) {
+                th.printStackTrace();
+                callback.error("解析配置失败");
+            }
+            return;
         } else if (!apiUrl.startsWith("http")) {
             configUrl = "http://" + configUrl;
         } else {
@@ -222,14 +247,59 @@ public class ApiConfig {
                     }
                 });
     }
+    
+    private void copyAssetsFile(String assetsName, String strOutFileName) throws IOException {
+        InputStream myInput;
+        OutputStream myOutput = new FileOutputStream(strOutFileName);
+        myInput = App.getInstance().getAssets().open(assetsName);
+        byte[] buffer = new byte[1024];
+        int length = myInput.read(buffer);
+        while(length > 0)
+        {
+            myOutput.write(buffer, 0, length);
+            length = myInput.read(buffer);
+        }
+        myOutput.flush();
+        myInput.close();
+        myOutput.close();
+    }
 
+    public String readAssetsText(String assetsName) throws IOException {
+        StringBuilder stringBuilder = new StringBuilder();
+        BufferedReader bf = new BufferedReader(new InputStreamReader(App.getInstance().getAssets().open(assetsName)));
+        String line;
+        while ((line = bf.readLine()) != null) {
+            stringBuilder.append(line);
+            stringBuilder.append("\n");
+        }
+        bf.close();
+        return stringBuilder.toString();
+    }
 
     public void loadJar(boolean useCache, String spider, LoadConfigCallback callback) {
         String[] urls = spider.split(";md5;");
         String jarUrl = urls[0];
         String md5 = urls.length > 1 ? urls[1].trim() : "";
+        
+        if (jarUrl.startsWith("asset://")) {
+            String jarCachePath = App.getInstance().getCacheDir().getAbsolutePath() + "/cache.jar";
+            File jarCache = new File(jarCachePath);
+            if (!jarCache.exists()) {
+                try {
+                    copyAssetsFile(spider.replace("asset://", ""), jarCachePath);
+                } catch (Throwable th) {
+                    th.printStackTrace();
+                }
+            }
+            if (jarLoader.load(jarCache.getAbsolutePath())) {
+                callback.success();
+            } else {
+                callback.error("");
+            }
+            return;
+        }
+        
         File cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/csp.jar");
-
         if (!md5.isEmpty() || useCache) {
             if (cache.exists() && (useCache || MD5.getFileMd5(cache).equalsIgnoreCase(md5))) {
                 if (jarLoader.load(cache.getAbsolutePath())) {
@@ -385,7 +455,7 @@ public class ApiConfig {
                 String extUrl = Uri.parse(url).getQueryParameter("ext");
                 if (extUrl != null && !extUrl.isEmpty()) {
                     String extUrlFix;
-                    if(extUrl.startsWith("http") || extUrl.startsWith("clan://")){
+                    if(extUrl.startsWith("http") || extUrl.startsWith("clan://") || extUrl.startsWith("asset")){
                         extUrlFix = extUrl;
                     }else {
                         extUrlFix = new String(Base64.decode(extUrl, Base64.DEFAULT | Base64.URL_SAFE | Base64.NO_WRAP), "UTF-8");
@@ -393,6 +463,8 @@ public class ApiConfig {
 //                    System.out.println("extUrlFix :"+extUrlFix);
                     if (extUrlFix.startsWith("clan://")) {
                         extUrlFix = clanContentFix(clanToAddress(apiUrl), extUrlFix);
+                    } else if(extUrlFix.startsWith("asset")){
+                        extUrlFix = readAssetsText(apiUrl.replace("asset://",""));
                     }
                     extUrlFix = Base64.encodeToString(extUrlFix.getBytes("UTF-8"), Base64.DEFAULT | Base64.URL_SAFE | Base64.NO_WRAP);
                     url = url.replace(extUrl, extUrlFix);
@@ -567,8 +639,20 @@ public class ApiConfig {
 
     public Spider getCSP(SourceBean sourceBean) {
         boolean js = sourceBean.getApi().endsWith(".js") || sourceBean.getApi().contains(".js?");
-        if (js) return jsLoader.getSpider(sourceBean.getKey(), sourceBean.getApi(), sourceBean.getExt(), sourceBean.getJar());
+        
+        if (js) {
+            return jsLoader.getSpider(sourceBean.getKey(), sourceBean.getApi(), sourceBean.getExt(), sourceBean.getJar());
+        } else if (ext.startsWith("asset://")) {
+            String ext = sourceBean.getExt();
+            try {
+                ext = readAssetsText(ext.replace("asset://",""));
+            } catch (IOException e) {
+                ext = null;
+            }
+            return jarLoader.getSpider(sourceBean.getKey(), sourceBean.getApi(), ext, sourceBean.getJar());
+        }
         return jarLoader.getSpider(sourceBean.getKey(), sourceBean.getApi(), sourceBean.getExt(), sourceBean.getJar());
+        
     }
 
     public Object[] proxyLocal(Map param) {
